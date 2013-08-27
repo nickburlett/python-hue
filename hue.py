@@ -1,8 +1,10 @@
 import requests
 import socket
+import binascii
 import json
 import datetime
 import logging
+import functools
 from time import sleep
 import hashlib
 from colorpy import colormodels
@@ -16,7 +18,6 @@ AUTH_FAILURE_SLEEP = 10
 
 
 class Hue:
-    station_ip = "192.168.1.130"
 
     # Hue appears to expect your username to be a 32 character hash
     client_identifier = hashlib.md5("ph-%s" % socket.getfqdn()).hexdigest()
@@ -25,10 +26,45 @@ class Hue:
     last_update_state = None
     is_allowed = True
     state = {}
-    lights = {}
+    _lights = {}
     groups = {}
     schedules = {}
     config = {}
+
+    @property
+    def lights(self):
+        return LightGroup(self._lights)
+
+    def __init__(self, station_ip=None):
+        if station_ip is None:
+            station_ip = self.find_station()
+        self.station_ip = station_ip
+        self.get_state()
+
+    def find_station(self):
+        MCAST_GRP = '239.255.255.250'
+        MCAST_PORT = 1900
+
+        payload = []
+        payload.append("M-SEARCH * HTTP/1.1")
+        payload.append("HOST: 239.255.255.250:1900")
+        payload.append("MAN: ssdp:discover")
+        payload.append("MX: 10")
+        payload.append("ST: ssdp:all")
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
+        sock.sendto("\n".join(payload), (MCAST_GRP, MCAST_PORT))
+
+        while 1:
+            try:
+                data, (ip_addr, port) = sock.recvfrom(1024)
+            except socket.error, e:
+                logger.exception("Failed to receive from multicast port")
+                raise
+            if "description.xml" in data:
+                return ip_addr
+
 
     def request(self, *args, **kwargs):
         path = "http://%s/api/%s%s" % (
@@ -105,13 +141,35 @@ class Hue:
         self.groups = state['groups']
 
         for l in state['lights']:
-            light = self.lights.get("l%s" % l, None)
+            light = self._lights.get("l%s" % l, None)
             if not light:
                 light = ExtendedColorLight(self, l)
-                self.lights["l%s" % l] = light
+                self._lights["l%s" % l] = light
             light.update_state_cache(state['lights'][l])
 
         self.last_update_state = datetime.datetime.now()
+
+colormodels.init(
+    phosphor_red=colormodels.xyz_color(0.64843, 0.33086),
+    phosphor_green=colormodels.xyz_color(0.4091, 0.518),
+    phosphor_blue=colormodels.xyz_color(0.167, 0.04))
+
+class LightGroup(object):
+    __slots__ = ['_lights']
+    def __init__(self, lights):
+        super(LightGroup, self).__setattr__('_lights', lights)
+
+    def __getattr__(self, name):
+        def apply_to_all(*args, **kwargs):
+            for l in self._lights.values():
+                getattr(l, name)(*args, **kwargs)
+            return self
+        origfunc = getattr(self._lights.itervalues().next(), name)
+        functools.update_wrapper(apply_to_all, origfunc)
+        return apply_to_all
+
+    def __getitem__(self, key):
+        return self._lights[key]
 
 
 class ExtendedColorLight:
@@ -123,6 +181,7 @@ class ExtendedColorLight:
     def __init__(self, hue, light_id):
         self.hue = hue
         self.light_id = light_id
+
 
     def update_state_cache(self, values=None):
         if not values:
@@ -173,23 +232,21 @@ class ExtendedColorLight:
 
     def rgb(self, red, green=None, blue=None, transitiontime=5):
         if isinstance(red, basestring):
+            if not red.startswith('#'):
+                raise ArgumentError('rgb strings must start with "#"')
             # assume a hex string is passed
             rstring = red
             red = int(rstring[1:3], 16)
             green = int(rstring[3:5], 16)
             blue = int(rstring[5:], 16)
 
-        print red, green, blue
+        logger.debug("%d %d %d"%(red, green, blue))
 
         # We need to convert the RGB value to Yxy.
         redScale = float(red) / 255.0
         greenScale = float(green) / 255.0
         blueScale = float(blue) / 255.0
-        colormodels.init(
-            phosphor_red=colormodels.xyz_color(0.64843, 0.33086),
-            phosphor_green=colormodels.xyz_color(0.4091, 0.518),
-            phosphor_blue=colormodels.xyz_color(0.167, 0.04))
-        logger.debug(redScale, greenScale, blueScale)
+        logger.debug("%d %d %d"%(redScale, greenScale, blueScale))
         xyz = colormodels.irgb_color(red, green, blue)
         logger.debug(xyz)
         xyz = colormodels.xyz_from_rgb(xyz)
